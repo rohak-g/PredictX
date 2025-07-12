@@ -1,0 +1,44 @@
+#!/bin/bash
+
+# Set the project directory (edit this according to your setup)
+SRC_DIR="/mnt/c/Users/Gupta/Desktop/vlsi/4th_sem/coa/GROUP_2_riscV/RTL"
+TOP_MODULE="single_cycle_top"
+
+OUT_DIR="/mnt/c/Users/Gupta/Desktop/vlsi/delay_predictor/Dataset/netlists"
+
+LIB_PATH="/mnt/c/Users/Gupta/Desktop/vlsi/delay_predictor/nangate45.lib"
+
+# === SETUP OUTPUT ===
+mkdir -p "$OUT_DIR"
+LOG_FILE="$OUT_DIR/synthesis_errors.txt"
+echo "Failed modules with errors:" > "$LOG_FILE"
+
+# === RUN YOSYS FOR FULL DIRECTORY ===
+echo "[▶] Running Yosys for top module: $TOP_MODULE"
+
+TEMP_ERR_FILE=$(mktemp)
+
+yosys -q -p "
+    read_verilog ${SRC_DIR}/*.v;
+    hierarchy -check -top $TOP_MODULE;
+    proc; opt;
+    flatten;           # <-- flatten the design
+    opt;               # optional optimization after flatten
+    synth -top $TOP_MODULE;
+    dfflibmap -liberty $LIB_PATH;
+    abc -liberty $LIB_PATH;
+    clean;
+    write_verilog -noattr \"$OUT_DIR/${TOP_MODULE}_gate_netlist.v\";
+    write_json \"$OUT_DIR/${TOP_MODULE}.json\";
+" 2> "$TEMP_ERR_FILE"
+
+if [ $? -ne 0 ]; then
+    echo "[✘] Synthesis failed for: $TOP_MODULE"
+    echo "$TOP_MODULE (directory: $SRC_DIR)" >> "$LOG_FILE"
+    cat "$TEMP_ERR_FILE" >> "$LOG_FILE"
+    echo "" >> "$LOG_FILE"
+else
+    echo "[✔] Synthesis successful. Flattened netlist saved in $OUT_DIR"
+fi
+
+rm -f "$TEMP_ERR_FILE"

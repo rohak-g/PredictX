@@ -1,0 +1,58 @@
+#!/bin/bash
+
+VERILOG_DIR="/mnt/c/Users/Gupta/Desktop/vlsi/delay_predictor/Dataset/modules/discarded"
+OUTPUT_DIR="/mnt/c/Users/Gupta/Desktop/vlsi/delay_predictor/Dataset/netlists/data2"
+LIB_PATH="/mnt/c/Users/Gupta/Desktop/vlsi/delay_predictor/nangate45.lib"
+
+mkdir -p "$OUTPUT_DIR"
+LOG_FILE="$OUTPUT_DIR/synthesis_errors.txt"
+echo "Failed modules with errors:" > "$LOG_FILE"
+
+# === Extract top module name from file contents ===
+get_top_module() {
+    grep -oP '^\s*module\s+\K\w+' "$1" | head -n 1
+}
+
+# === Loop through all .v files ===
+for file in "$VERILOG_DIR"/*.v; do
+    filename=$(basename -- "$file")
+    echo "[▶] Processing $filename"
+
+    top_module=$(get_top_module "$file")
+    if [ -z "$top_module" ]; then
+        echo "[✘] Could not detect top module in $filename"
+        echo "$filename: No top module found" >> "$LOG_FILE"
+        continue
+    fi
+
+    # Sanitize file name
+    base_filename=$(basename "$file" | tr -d '\r"“”’‘')
+    base_filename="${base_filename%.v}"
+
+    # Use a temporary file to capture yosys errors
+    TEMP_ERR_FILE=$(mktemp)
+
+    yosys -q -p "
+        read_verilog \"$file\";
+        hierarchy -check -top $top_module;
+        synth -top $top_module;
+        dfflibmap -liberty $LIB_PATH;
+        abc -liberty $LIB_PATH;
+        clean;
+        write_verilog \"$OUTPUT_DIR/${base_filename}_gate_netlist.v\";
+        write_json \"$OUTPUT_DIR/${base_filename}.json\";
+    " 2> "$TEMP_ERR_FILE"
+
+    if [ $? -ne 0 ]; then
+        echo "[✘] Synthesis failed for: $filename (top: $top_module)"
+        echo "$filename (top: $top_module)" >> "$LOG_FILE"
+        cat "$TEMP_ERR_FILE" >> "$LOG_FILE"
+        echo "" >> "$LOG_FILE"
+    else
+        echo "[✔] Success: $filename (top: $top_module)"
+    fi
+
+    rm -f "$TEMP_ERR_FILE"
+done
+
+echo "✅ All files processed. Check $LOG_FILE for any failures."

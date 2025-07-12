@@ -1,0 +1,226 @@
+import os
+import torch
+import pandas as pd
+from torch_geometric.data import Dataset, Data
+from torch_geometric.loader import DataLoader
+from torch_geometric.nn import GATConv, SGConv, global_max_pool
+import torch.nn.functional as F
+import torch.nn as nn
+from tqdm import tqdm
+import json
+import numpy as np
+
+
+class CircuitDataset(Dataset):
+    def __init__(self, root, graph_dirs, gate_mapping=None):
+        super().__init__()
+        self.graph_dirs = [os.path.join(root, d) for d in graph_dirs]
+        self.gate_mapping = gate_mapping or self._generate_gate_mapping()
+        self.graphs = []
+        self._load_graphs()
+
+    def _generate_gate_mapping(self):
+        gate_set = set()
+        for d in self.graph_dirs:
+            fp = os.path.join(d, "node_features.csv")
+            if os.path.exists(fp):
+                df = pd.read_csv(fp)
+                if 'gate_type' in df.columns:
+                    gate_set.update(df['gate_type'].dropna().unique())
+        return {gt: idx for idx, gt in enumerate(sorted(gate_set), start=1)}  # reserve 0 for unknown
+
+    def len(self):
+        return len(self.graphs)
+
+    def get(self, idx):
+        return self.graphs[idx]
+
+    def _load_graphs(self):
+        print("Loading graph data...")
+        for i, graph_dir in enumerate(self.graph_dirs):
+            try:
+                nf_path = os.path.join(graph_dir, "node_features.csv")
+                edge_path = os.path.join(graph_dir, "adjacency.csv")
+                label_path = os.path.join(graph_dir, "label.json")
+
+                if not all(os.path.exists(p) for p in [nf_path, edge_path, label_path]):
+                    print(f"skip {i}: missing file(s)")
+                    continue
+
+                x_df = pd.read_csv(nf_path)
+                x_df_numeric = x_df.drop(columns=['gate_type']) if 'gate_type' in x_df.columns else x_df
+                x_df_numeric = x_df_numeric.apply(pd.to_numeric, errors='coerce').fillna(0)
+                x = torch.tensor(x_df_numeric.values.astype(np.float32), dtype=torch.float)
+
+                if 'gate_type' in x_df.columns:
+                    gate = x_df['gate_type'].map(self.gate_mapping).fillna(0).astype(int).values
+                    gate = torch.tensor(gate, dtype=torch.long)
+                    gate = F.one_hot(gate, num_classes=len(self.gate_mapping)+1).float()
+                    x = torch.cat([x, gate], dim=1)
+
+                adj_df = pd.read_csv(edge_path, comment='#', index_col=0)
+                edge_index_list = []
+                nodes = list(adj_df.columns)
+                for src_idx, src in enumerate(nodes):
+                    for tgt_idx, tgt in enumerate(nodes):
+                        try:
+                            val = int(adj_df.iloc[src_idx, tgt_idx])
+                            if val == 1:
+                                edge_index_list.append([src_idx, tgt_idx])
+                        except:
+                            continue
+
+                edge_index = torch.tensor(edge_index_list, dtype=torch.long).t().contiguous()
+
+                with open(label_path) as f:
+                    label = json.load(f)
+                if "critical_path_delay" not in label or label["critical_path_delay"] is None:
+                    raise ValueError("Missing or null 'critical_path_delay' in label file.")
+                y = torch.tensor([label["critical_path_delay"]], dtype=torch.float)
+
+
+                data = Data(x=x, edge_index=edge_index, y=y)
+                self.graphs.append(data)
+                print(f"Loaded graph {i}: {graph_dir}")
+
+            except Exception as e:
+                print(f"skip {i}: {e}")
+
+class GNNModel(torch.nn.Module):
+    def __init__(self, input_dim, hidden_dim=64, heads=4):
+        super(GNNModel, self).__init__()
+
+        # GAT layer with concat=True --> output_dim = hidden_dim * heads
+        self.gat = GATConv(input_dim, hidden_dim, heads=heads, concat=True, edge_dim=1)  # output_dim = hidden_dim * heads
+        gat_out_dim = hidden_dim * heads
+
+        # SGC layers
+        self.sgc1 = SGConv(gat_out_dim, hidden_dim)
+        self.sgc2 = SGConv(hidden_dim, hidden_dim)
+
+        # Fully connected layers
+        self.lin1 = nn.Linear(hidden_dim, hidden_dim)
+        self.lin2 = nn.Linear(hidden_dim, 1)
+
+        # Regularization (optional)
+        self.dropout = nn.Dropout(0.3)
+
+    def forward(self, data):
+        x, edge_index, batch = data.x, data.edge_index, data.batch
+        edge_attr = None  # if you use edge features, modify here
+
+        # GAT with concat=True
+        x = F.elu(self.gat(x, edge_index, edge_attr))
+
+        # SGC layers
+        x = F.relu(self.sgc1(x, edge_index))
+        x = self.dropout(x)
+        x = F.relu(self.sgc2(x, edge_index))
+
+        # Pooling and MLP
+        x = global_max_pool(x, batch)
+        x = F.relu(self.lin1(x))
+        x = self.lin2(x).squeeze(-1)
+        return x
+
+
+
+from sklearn.model_selection import train_test_split
+import matplotlib.pyplot as plt
+
+def evaluate_accuracy(model, test_set, test_dirs, save_path="test_predictions.txt"):
+    model.eval()
+    test_loader = DataLoader(test_set, batch_size=1, shuffle=False)
+
+    correct = 0
+    total = 0
+    results = []
+
+    with torch.no_grad():
+        for i, batch in enumerate(test_loader):
+            batch = batch.cuda()
+            pred = model(batch).item()
+            actual = batch.y.item()
+
+            lower = actual * 0.95
+            upper = actual * 1.05
+            if lower <= pred <= upper:
+                correct += 1
+            total += 1
+
+            module_name = os.path.basename(test_dirs[i])
+            results.append(f"{module_name}\tPredicted: {pred:.4f}\tActual: {actual:.4f}")
+
+    acc = 100 * correct / total
+    print(f"Final Test Accuracy (±5%): {acc:.2f}%")
+
+    with open(save_path, "w") as f:
+        f.write("Module\t\tPredicted Delay\tActual Delay\n")
+        f.write("-" * 50 + "\n")
+        for line in results:
+            f.write(line + "\n")
+
+    print(f"Saved predictions to {save_path}")
+    return acc
+
+def train():
+    root = r"C:/Users/gupta/Desktop/vlsi/delay_predictor/Dataset/ordered/data1"
+    dirs = [d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))]
+    print(f"Found {len(dirs)} circuit directories.")
+
+    dataset = CircuitDataset(root, dirs)
+    if len(dataset) == 0:
+        print("Loaded 0 circuits. Exiting.")
+        return
+
+    print("Splitting data into train and test...")
+    indices = list(range(len(dataset)))
+    train_idx, test_idx = train_test_split(indices, test_size=0.2, random_state=42)
+
+    train_set = [dataset[i] for i in train_idx]
+    test_set = [dataset[i] for i in test_idx]
+    test_dirs_full = [dirs[i] for i in test_idx]
+
+    train_loader = DataLoader(train_set, batch_size=4, shuffle=True)
+
+    model = GNNModel(input_dim=dataset[0].x.shape[1]).cuda()
+    opt = torch.optim.Adam(model.parameters(), lr=0.001)
+
+    loss_values = []
+
+    for ep in range(1, 76):
+        model.train()
+        total_loss = 0
+        for batch in tqdm(train_loader, desc=f"Epoch {ep}"):
+            batch = batch.cuda()
+            pred = model(batch)
+            loss = F.mse_loss(pred, batch.y)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            total_loss += loss.item() * batch.num_graphs
+
+        avg_loss = total_loss / len(train_set)
+        loss_values.append(avg_loss)
+        print(f"Epoch {ep} - Loss: {avg_loss:.4f}")
+
+    # Evaluate after training
+    evaluate_accuracy(model, test_set, test_dirs_full)
+
+    # Plot loss curve
+    plt.plot(range(1, 76), loss_values, marker='o')
+    plt.title("Training Loss over Epochs")
+    plt.xlabel("Epoch")
+    plt.ylabel("MSE Loss")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig("loss_curve.png")
+    plt.show()
+
+
+if __name__ == "__main__":
+    train()
+
+
+
+
